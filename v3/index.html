@@ -1,0 +1,346 @@
+﻿<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#d9d9df">
+<title>케이 입체 v3</title>
+<style>
+  :root { --bg:#d9d9df; --ink:#2a2230; --pill:rgba(30,22,34,.58); --pillOn:#7a1f35; }
+  html,body { margin:0; height:100%; background:var(--bg); overflow:hidden; overscroll-behavior:none;
+    font-family:-apple-system,"Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR",sans-serif; -webkit-tap-highlight-color:transparent; }
+  #c { position:fixed; inset:0; width:100vw; height:100vh; height:100dvh; display:block; touch-action:none; }
+  #fallback { position:fixed; inset:0; display:none; background:var(--bg) center bottom / auto 86% no-repeat; }
+  .top { position:fixed; left:0; right:0; top:max(10px, env(safe-area-inset-top)); display:flex; flex-direction:column; align-items:center; gap:8px; pointer-events:none; }
+  .badge { font-size:13px; letter-spacing:.02em; color:var(--ink); background:rgba(255,255,255,.55); padding:5px 12px; border-radius:999px;
+    backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px); }
+  .bottom { position:fixed; left:0; right:0; bottom:max(14px, env(safe-area-inset-bottom)); display:flex; flex-direction:column; align-items:center; gap:8px; pointer-events:none; }
+  .chips { display:flex; gap:6px; flex-wrap:wrap; justify-content:center; padding:0 12px; pointer-events:auto; }
+  .chip { border:0; font:inherit; font-size:14px; color:#fff; background:var(--pill); padding:8px 13px; border-radius:999px;
+    backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); cursor:pointer; min-height:36px; transition:background .2s, opacity .2s; }
+  .chip.on { background:var(--pillOn); }
+  .chip:disabled { opacity:.45; }
+  .hint { font-size:12px; color:#fff; background:rgba(30,22,34,.42); padding:4px 10px; border-radius:999px; transition:opacity .8s; }
+  #gyroBtn { display:none; pointer-events:auto; border:0; font:inherit; font-size:14px; color:#fff; background:var(--pillOn); padding:9px 16px; border-radius:999px; }
+  #loading { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; color:var(--ink); font-size:15px; }
+  #err { position:fixed; left:12px; right:12px; top:60px; display:none; background:#fff3f3; color:#8a1c1c; padding:10px 12px; border-radius:10px; font-size:13px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="fallback"></div>
+<div id="loading">케이를 불러오는 중…</div>
+<div class="top"><span class="badge">케이 · 입체 시험판 v3</span><button id="gyroBtn">기울여서 보기 켜기</button></div>
+<div class="bottom">
+  <div class="hint" id="hint">폰을 기울이거나 화면을 끌어 보세요 · 케이를 톡 누르면 웃어요</div>
+  <div class="chips" id="chips">
+    <button class="chip on" data-e="neutral">기본</button>
+    <button class="chip" data-e="smile" disabled>웃음</button>
+    <button class="chip" data-e="cheer" disabled>축하</button>
+    <button class="chip" data-e="concern" disabled>걱정</button>
+    <button class="chip" data-e="thinking" disabled>생각중</button>
+  </div>
+</div>
+<div id="err"></div>
+<script>
+'use strict';
+/* 케이 입체 시험판 v3
+   - 얼굴·몸 픽셀은 원본 k_final.png 그대로 (생성형으로 새로 그리지 않음)
+   - 원본 사진 + 깊이맵(Depth Anything V2 Large)으로 만든 입체 그물(256x256)에 사진을 입힘
+   - 배경은 원본 배경색을 수식으로 복원한 별도 층 (인물과 따로 움직여 시차가 생김)
+   - 눈깜박임 = 기존 idle 영상의 눈 부분, 표정 = 기존 표정 사진 5종을 원본 위치에 맞춰 교차 전환 */
+const Q = new URLSearchParams(location.search);
+const STILL = Q.has('still');
+const $ = (id) => document.getElementById(id);
+const K = window.__k = { ready: false, fps: 0 };
+function showErr(m) { const e = $('err'); e.textContent = m; e.style.display = 'block'; }
+function fallback(why) {
+  $('loading').style.display = 'none'; $('c').style.display = 'none';
+  const f = $('fallback'); f.style.backgroundImage = 'url(k_person.webp)'; f.style.display = 'block';
+  showErr('이 기기에서는 입체 표시가 안 되어 사진으로 보여드립니다 (' + why + ')');
+}
+
+const canvas = $('c');
+const gl = canvas.getContext('webgl', { antialias: true, alpha: false, premultipliedAlpha: false, preserveDrawingBuffer: Q.has('cap') });
+if (!gl) { fallback('WebGL 없음'); throw new Error('no webgl'); }
+const uintIdx = gl.getExtension('OES_element_index_uint');
+
+/* ---------- 작은 행렬 도구 ---------- */
+function persp(fovy, asp, n, f) { const t = 1 / Math.tan(fovy / 2), nf = 1 / (n - f);
+  return [t / asp,0,0,0, 0,t,0,0, 0,0,(f + n) * nf,-1, 0,0,2 * f * n * nf,0]; }
+function lookAt(e, c, u) {
+  let zx = e[0]-c[0], zy = e[1]-c[1], zz = e[2]-c[2]; let l = Math.hypot(zx,zy,zz); zx/=l; zy/=l; zz/=l;
+  let xx = u[1]*zz-u[2]*zy, xy = u[2]*zx-u[0]*zz, xz = u[0]*zy-u[1]*zx; l = Math.hypot(xx,xy,xz); xx/=l; xy/=l; xz/=l;
+  const yx = zy*xz-zz*xy, yy = zz*xx-zx*xz, yz = zx*xy-zy*xx;
+  return [xx,yx,zx,0, xy,yy,zy,0, xz,yz,zz,0, -(xx*e[0]+xy*e[1]+xz*e[2]), -(yx*e[0]+yy*e[1]+yz*e[2]), -(zx*e[0]+zy*e[1]+zz*e[2]), 1]; }
+function mul(a, b) { const o = new Array(16); for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) {
+  let s = 0; for (let k = 0; k < 4; k++) s += a[k*4+j] * b[i*4+k]; o[i*4+j] = s; } return o; }
+
+/* ---------- 셰이더 ---------- */
+function prog(vs, fs) {
+  const sh = (t, s) => { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o);
+    if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o)); return o; };
+  const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const a = gl.getActiveUniform(p, i); u[a.name.replace('[0]', '')] = gl.getUniformLocation(p, a.name); }
+  return { p, u };
+}
+// 배경: 원본 배경을 4차 다항식으로 복원 + 케이의 부드러운 그림자
+const BG_VS = `attribute vec2 aP; uniform mat4 uM; uniform float uZ; varying vec2 vW;
+  void main(){ vW = aP; gl_Position = uM * vec4(aP, uZ, 1.0); }`;
+const BG_FS = `precision highp float; varying vec2 vW;
+  uniform vec3 uMap; uniform sampler2D uPerson, uBg; uniform vec2 uShadowOff; uniform float uShadow;
+  void main(){
+    vec2 im = uMap.xy + (vW - uMap.xy) * uMap.z;            // 배경 평면 → 원본 사진 좌표
+    vec2 uv = vec2(im.x + 0.5, 0.5 - im.y);
+    vec3 col = texture2D(uBg, clamp(uv, 0.002, 0.998)).rgb; // 원본 배경(인물을 빼고 매끈하게 복원한 판)
+    float top = clamp(-uv.y*1.2, 0.0, 1.0); col *= 1.0 - 0.05*top;            // 사진 위쪽으로 넘어간 부분은 아주 살짝 어둡게
+    float sh = texture2D(uPerson, uv + uShadowOff, 5.0).a;                     // 흐린 실루엣 = 그림자
+    col *= 1.0 - uShadow * sh;
+    float n = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233))) * 43758.5453);
+    gl_FragColor = vec4(col + (n-0.5)/255.0, 1.0);
+  }`;
+// 케이: 깊이 그물 + 원본 사진. 머리(목 위)는 목을 축으로 아주 조금 돌고, 어깨는 숨쉬기로 오르내림
+const P_VS = `attribute vec2 aUV; attribute float aZ; uniform mat4 uM; uniform float uDepth, uFocus;
+  uniform vec3 uHead; uniform vec3 uPivot; uniform float uBreath; uniform vec3 uT; uniform float uCamD; varying vec2 vUV;
+  vec3 rot(vec3 p, vec3 r){ float cy=cos(r.x), sy=sin(r.x), cp=cos(r.y), sp=sin(r.y), cr=cos(r.z), sr=sin(r.z);
+    p = vec3(cr*p.x - sr*p.y, sr*p.x + cr*p.y, p.z);
+    p = vec3(p.x, cp*p.y - sp*p.z, sp*p.y + cp*p.z);
+    p = vec3(cy*p.x + sy*p.z, p.y, -sy*p.x + cy*p.z); return p; }
+  void main(){ vUV = vec2(aUV.x, min(aUV.y, 0.9995));
+    vec3 p = vec3(aUV.x - 0.5, 0.5 - aUV.y, uDepth * (aZ - uFocus));
+    p.xy = uT.xy + (p.xy - uT.xy) * (uCamD - p.z) / uCamD;   // 정면에서는 원본 사진과 픽셀 위치가 똑같도록 원근 보정
+    p.y +=uBreath * smoothstep(-0.52, -0.12, p.y);
+    float w = smoothstep(-0.25, -0.11, p.y);
+    p = uPivot + rot(p - uPivot, uHead * w);
+    gl_Position = uM * vec4(p, 1.0); }`;
+const P_FS = `precision highp float; varying vec2 vUV;
+  uniform sampler2D uPerson, uExA, uExB, uBlink; uniform float uWA, uWB, uBlinkW, uBlinkF, uBlinkN; uniform vec4 uBlinkR;
+  void main(){
+    vec4 p = texture2D(uPerson, vUV);               // 미리 곱한 알파(premultiplied)
+    if (p.a < 0.004) discard;
+    vec3 c = p.rgb;
+    if (uWA > 0.0) c = mix(c, texture2D(uExA, vUV).rgb * p.a, uWA);
+    if (uWB > 0.0) c = mix(c, texture2D(uExB, vUV).rgb * p.a, uWB);
+    if (uBlinkW > 0.0) {
+      vec2 b = (vUV - uBlinkR.xy) / (uBlinkR.zw - uBlinkR.xy);
+      if (b.x > 0.0 && b.x < 1.0 && b.y > 0.0 && b.y < 1.0) {
+        float fy = clamp(b.y, 0.004, 0.996);
+        vec4 e = texture2D(uBlink, vec2(b.x, (uBlinkF + fy) / uBlinkN));
+        c = mix(c, e.rgb * p.a, e.a * uBlinkW);
+      }
+    }
+    gl_FragColor = vec4(c, p.a);
+  }`;
+
+let bgP, pP;
+try { bgP = prog(BG_VS, BG_FS); pP = prog(P_VS, P_FS); }
+catch (e) { fallback('셰이더 오류'); throw e; }
+
+/* ---------- 텍스처 ---------- */
+function loadImg(src) { return new Promise((ok, no) => { const i = new Image(); i.decoding = 'async';
+  i.onload = () => ok(i); i.onerror = () => no(new Error(src + ' 불러오기 실패')); i.src = src; }); }
+function makeTex(img, { mip = false, premul = false } = {}) {
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, premul);
+  gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+  if (mip) { gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
+  else gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  return t;
+}
+
+/* ---------- 상태 ---------- */
+let meta, texPerson, texBlink, texBg, gridN, idxCount, idxType;
+const texExpr = {};               // smile/cheer/concern/thinking
+const vb = { bg: gl.createBuffer(), uv: gl.createBuffer(), z: gl.createBuffer(), idx: gl.createBuffer() };
+const DEPTH = parseFloat(Q.get('depth') || '0.34');     // 입체 깊이 세기
+const MAXYAW = 0.14, MAXPITCH = 0.09;                   // 기울임 최대 각도(라디안) ≈ 8도·5도
+
+async function init() {
+  const [m, dep, img, blink, bgImg] = await Promise.all([
+    fetch('k_meta.json').then((r) => { if (!r.ok) throw new Error('k_meta.json ' + r.status); return r.json(); }),
+    fetch('k_depth.bin').then((r) => { if (!r.ok) throw new Error('k_depth.bin ' + r.status); return r.arrayBuffer(); }),
+    loadImg('k_person.webp'), loadImg('k_blink.webp'), loadImg('k_bg.png')]);
+  meta = m; gridN = m.grid;
+  texPerson = makeTex(img, { mip: true, premul: true });
+  texBlink = makeTex(blink);
+  // 깊이 그물
+  // 사진 아래로 '앞치마' 줄(E줄)을 덧붙여, 기울여도 옷 아래 끝이 떠 보이지 않게 함
+  const N = gridN, E = 24, R = N + E, z16 = new Uint16Array(dep), uv = new Float32Array(N * R * 2), zf = new Float32Array(N * R);
+  for (let j = 0; j < R; j++) for (let i = 0; i < N; i++) { const k = j * N + i, js = Math.min(j, N - 1);
+    uv[k*2] = i / (N - 1); uv[k*2+1] = j < N ? j / (N - 1) : 1 + (j - N + 1) * (0.14 / E); zf[k] = z16[js * N + i] / 65535; }
+  if (N * R > 65536 && !uintIdx) throw new Error('큰 그물 지원 안 됨(OES_element_index_uint)');
+  const useU32 = N * R > 65536;
+  const ix = useU32 ? new Uint32Array((R-1)*(N-1)*6) : new Uint16Array((R-1)*(N-1)*6); let q = 0;
+  for (let j = 0; j < R-1; j++) for (let i = 0; i < N-1; i++) { const a = j*N+i, b = a+1, c = a+N, d = c+1;
+    ix[q++]=a; ix[q++]=c; ix[q++]=b; ix[q++]=b; ix[q++]=c; ix[q++]=d; }
+  idxCount = q; idxType = useU32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+  gl.bindBuffer(gl.ARRAY_BUFFER, vb.uv); gl.bufferData(gl.ARRAY_BUFFER, uv, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vb.z); gl.bufferData(gl.ARRAY_BUFFER, zf, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, vb.idx); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, ix, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vb.bg); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-4,-4, 4,-4, -4,4, 4,4]), gl.STATIC_DRAW);
+  texBg = makeTex(bgImg);
+  $('loading').style.display = 'none';
+  K.ready = true;
+  // 표정 사진은 첫 화면이 뜬 뒤에 천천히 받음 (첫 로딩 용량 줄이기)
+  for (const e of ['smile', 'cheer', 'concern', 'thinking']) {
+    loadImg('k_expr_' + e + '.webp').then((im) => { texExpr[e] = makeTex(im, { mip: true });
+      const b = document.querySelector('.chip[data-e="' + e + '"]'); if (b) b.disabled = false;
+      if (Q.get('expr') === e) setExpr(e, true);
+      K['expr_' + e] = true; }).catch((err) => showErr(err.message));
+  }
+}
+
+/* ---------- 표정 ---------- */
+let exCur = 'neutral', exPrev = null, exT = 1, pokeTimer = 0;
+function setExpr(e, instant) {
+  if (e !== 'neutral' && !texExpr[e]) return;
+  if (e === exCur) return;
+  exPrev = exCur; exCur = e; exT = instant ? 1 : 0;
+  document.querySelectorAll('.chip').forEach((b) => b.classList.toggle('on', b.dataset.e === e));
+}
+$('chips').addEventListener('click', (ev) => { const b = ev.target.closest('.chip'); if (!b || b.disabled) return;
+  clearTimeout(pokeTimer); setExpr(b.dataset.e); });
+
+/* ---------- 입력: 끌기 + 기울기 ---------- */
+const target = { x: 0, y: 0 }, cur = { x: 0, y: 0 };
+let drag = null, gyro = null, gbase = null, lastInput = -1e9;
+canvas.addEventListener('pointerdown', (e) => { drag = { x: e.clientX, y: e.clientY, t: performance.now(), moved: 0 }; canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener('pointermove', (e) => { if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y; drag.moved = Math.max(drag.moved, Math.hypot(dx, dy));
+  target.x = Math.max(-1, Math.min(1, dx / (canvas.clientWidth * 0.4)));
+  target.y = Math.max(-1, Math.min(1, dy / (canvas.clientHeight * 0.3))); lastInput = performance.now(); });
+function endDrag() { if (!drag) return;
+  const tap = drag.moved < 8 && performance.now() - drag.t < 350; drag = null; target.x = 0; target.y = 0;
+  if (tap && exCur === 'neutral' && texExpr.smile) { setExpr('smile'); clearTimeout(pokeTimer);
+    pokeTimer = setTimeout(() => { if (exCur === 'smile') setExpr('neutral'); }, 2600); } }
+canvas.addEventListener('pointerup', endDrag); canvas.addEventListener('pointercancel', endDrag);
+function onOrient(e) { if (e.beta == null || e.gamma == null) return;
+  if (!gbase) { gbase = { b: e.beta, g: e.gamma }; $('gyroBtn').style.display = 'none'; }
+  gbase.b += (e.beta - gbase.b) * 0.004; gbase.g += (e.gamma - gbase.g) * 0.004;   // 들고 있는 각도에 천천히 적응
+  gyro = { x: Math.max(-1, Math.min(1, (e.gamma - gbase.g) / 18)), y: Math.max(-1, Math.min(1, (e.beta - gbase.b) / 18)) };
+  lastInput = performance.now(); }
+window.addEventListener('deviceorientation', onOrient);
+if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+  setTimeout(() => { if (!gbase) $('gyroBtn').style.display = 'block'; }, 1200);   // 아이폰처럼 권한이 필요한 기기에서만 버튼 표시
+  $('gyroBtn').onclick = () => DeviceOrientationEvent.requestPermission()
+    .then((r) => { $('gyroBtn').style.display = r === 'granted' ? 'none' : 'block'; if (r !== 'granted') $('gyroBtn').textContent = '권한 거부됨 — 끌어서 보세요'; })
+    .catch(() => { $('gyroBtn').textContent = '기울기를 쓸 수 없음 — 끌어서 보세요'; });
+}
+setTimeout(() => { $('hint').style.opacity = '0'; }, 7000);
+if (Q.has('clean')) document.querySelectorAll('.top,.bottom').forEach((n) => { n.style.display = 'none'; });
+
+/* ---------- 화면 맞춤 ---------- */
+let W = 0, H = 0;
+function fit() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+  W = canvas.clientWidth; H = canvas.clientHeight;
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+window.addEventListener('resize', fit); fit();
+
+/* ---------- 그리기 ---------- */
+const FOV = 26 * Math.PI / 180, BGZ = -0.62;
+let nextBlink = 1.6, blinkStart = -1, dbl = false, fpsN = 0, fpsT = 0;
+const t0 = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (!K.ready || document.hidden) return;
+  const t = Q.has('t') ? parseFloat(Q.get('t')) : (now - t0) / 1000;
+  fpsN++; if (now - fpsT > 1000) { K.fps = fpsN; fpsN = 0; fpsT = now; }
+
+  // 케이 크기: 화면 높이의 약 88% (단, 폭이 좁으면 머리카락이 잘리지 않게 폭 기준으로 줄임)
+  const size = Math.min(H * 0.88, W * 1.85);
+  const worldH = H / size, D = worldH / (2 * Math.tan(FOV / 2));
+  const yBottom = -0.5 + 0.02;                            // 사진 아래 끝을 화면 아래보다 살짝 내림 (기울여도 빈틈 없게)
+  const T = [0, yBottom + worldH / 2, 0];
+
+  // 기울기 목표값: 입력 > 없으면 천천히 저절로 흔들림
+  let tx = target.x, ty = target.y;
+  if (gyro && !drag) { tx = gyro.x; ty = gyro.y; }
+  if (Q.has('tilt')) { const a = Q.get('tilt').split(',').map(Number); tx = a[0]; ty = a[1] || 0; cur.x = tx; cur.y = ty; }
+  const idle = (STILL || drag || Q.has('tilt') || now - lastInput < 2500) ? 0 : 1;
+  tx += idle * (0.45 * Math.sin(t * 0.42) + 0.12 * Math.sin(t * 1.07));
+  ty += idle * (0.25 * Math.sin(t * 0.61 + 0.8));
+  cur.x += (tx - cur.x) * 0.1; cur.y += (ty - cur.y) * 0.1;
+  const yaw = -cur.x * MAXYAW, pitch = cur.y * MAXPITCH;
+  const eye = [T[0] + D * Math.sin(yaw) * Math.cos(pitch), T[1] + D * Math.sin(pitch), T[2] + D * Math.cos(yaw) * Math.cos(pitch)];
+  const M = mul(persp(FOV, W / H, 0.05, 20), lookAt(eye, T, [0, 1, 0]));
+
+  // 숨쉬기(약 4.2초 주기)와 고개의 아주 작은 움직임
+  const breath = STILL ? 0 : 0.0045 * (0.5 - 0.5 * Math.cos(t * 2 * Math.PI / 4.2));
+  const head = STILL ? [0, 0, 0] : [0.022 * Math.sin(t * 0.37),0.014 * Math.sin(t * 0.53 + 1.0), 0.012 * Math.sin(t * 0.29 + 2.0)];
+
+  // 눈깜박임 (기본 표정일 때만, 3~6초마다, 가끔 두 번)
+  let blinkW = 0, blinkF = 0;
+  if (Q.has('blink')) { blinkW = 1; blinkF = Math.min(meta.blink.frames - 1, parseInt(Q.get('blink'), 10) || 0); }
+  else if (!STILL && exCur === 'neutral' && exT >= 1) {
+    if (blinkStart < 0 && t > nextBlink) { blinkStart = t; }
+    if (blinkStart >= 0) {
+      const f = (t - blinkStart) * 42;                    // 초당 42장 → 약 0.4초
+      if (f >= meta.blink.frames) { blinkStart = -1; if (!dbl && Math.random() < 0.2) { dbl = true; nextBlink = t + 0.25; } else { dbl = false; nextBlink = t + 3 + Math.random() * 3; } }
+      else { blinkF = Math.floor(f); blinkW = f > meta.blink.frames - 2 ? (meta.blink.frames - f) / 2 : 1; }
+    }
+  } else { blinkStart = -1; }
+
+  // 표정 교차 전환 (0.35초)
+  if (exT < 1) exT = Math.min(1, exT + 1 / 21);
+  const ease = exT * exT * (3 - 2 * exT);
+  let wA = 0, wB = 0, tA = null, tB = null;
+  if (exCur !== 'neutral') { tB = texExpr[exCur]; wB = ease; }
+  if (exPrev && exPrev !== 'neutral' && exT < 1) { tA = texExpr[exPrev]; wA = 1 - ease; }
+  if (exT >= 1) exPrev = null;
+  // 이전 표정 → 새 표정: A를 먼저 섞고 B를 그 위에 섞음 (둘 다 기본 위에서)
+  if (tA && tB) { wA = 1; }
+
+  gl.clearColor(0.85, 0.85, 0.87, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  // 1) 배경 층
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+  gl.useProgram(bgP.p);
+  gl.uniformMatrix4fv(bgP.u.uM, false, M); gl.uniform1f(bgP.u.uZ, BGZ);
+  const ratio = D / (D - BGZ);                            // 기본 시점에서 배경이 원본 위치에 오도록
+  gl.uniform3f(bgP.u.uMap, T[0], T[1], ratio);
+  gl.uniform2f(bgP.u.uShadowOff, -0.018 + cur.x * 0.006, -0.012);
+  gl.uniform1f(bgP.u.uShadow, Q.has('noshadow') ? 0 : 0.08);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texPerson); gl.uniform1i(bgP.u.uPerson, 0);
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, texBg); gl.uniform1i(bgP.u.uBg, 4);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vb.bg);
+  const la = gl.getAttribLocation(bgP.p, 'aP'); gl.enableVertexAttribArray(la); gl.vertexAttribPointer(la, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); gl.disableVertexAttribArray(la);
+  // 2) 케이 층
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(pP.p);
+  gl.uniformMatrix4fv(pP.u.uM, false, M);
+  gl.uniform1f(pP.u.uDepth, DEPTH); gl.uniform1f(pP.u.uFocus, meta.focus);
+  gl.uniform3f(pP.u.uHead, head[0], head[1], head[2]);
+  gl.uniform3f(pP.u.uPivot, 0, -0.17, DEPTH * (0.45 - meta.focus));
+  gl.uniform1f(pP.u.uBreath, breath);
+  gl.uniform3f(pP.u.uT, T[0], T[1], T[2]); gl.uniform1f(pP.u.uCamD, D);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texPerson); gl.uniform1i(pP.u.uPerson, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tA || texPerson); gl.uniform1i(pP.u.uExA, 1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, tB || texPerson); gl.uniform1i(pP.u.uExB, 2);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, texBlink); gl.uniform1i(pP.u.uBlink, 3);
+  gl.uniform1f(pP.u.uWA, tA ? wA : 0); gl.uniform1f(pP.u.uWB, tB ? wB : 0);
+  gl.uniform1f(pP.u.uBlinkW, blinkW); gl.uniform1f(pP.u.uBlinkF, blinkF); gl.uniform1f(pP.u.uBlinkN, meta.blink.frames);
+  const r = meta.blink.rect; gl.uniform4f(pP.u.uBlinkR, r[0], r[1], r[2], r[3]);
+  const au = gl.getAttribLocation(pP.p, 'aUV'), az = gl.getAttribLocation(pP.p, 'aZ');
+  gl.bindBuffer(gl.ARRAY_BUFFER, vb.uv); gl.enableVertexAttribArray(au); gl.vertexAttribPointer(au, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, vb.z); gl.enableVertexAttribArray(az); gl.vertexAttribPointer(az, 1, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, vb.idx);
+  gl.drawElements(gl.TRIANGLES, idxCount, idxType, 0);
+  gl.disableVertexAttribArray(au); gl.disableVertexAttribArray(az);
+  K.frames = (K.frames || 0) + 1;
+}
+init().then(() => requestAnimationFrame(frame)).catch((e) => { showErr('불러오기 오류: ' + e.message); fallback(e.message); });
+canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); showErr('그래픽이 잠시 끊겼습니다. 새로고침해 주세요.'); });
+</script>
+</body>
+</html>
